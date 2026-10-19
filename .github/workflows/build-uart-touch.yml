@@ -1,0 +1,323 @@
+name: openHASP 3.5 UART firmware
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-uart-touch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Get the original openHASP 0.7.0.1 source
+        uses: actions/checkout@v6
+        with:
+          repository: HASwitchPlate/openHASP
+          ref: d1a0770c8a992c2945a1c9c5702d2e6cfb9cb705
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install PlatformIO and build helpers
+        run: >-
+          python -m pip install --disable-pip-version-check
+          platformio==6.1.16 dulwich==1.2.17 wheel==0.48.0
+          zopfli==0.4.3 tasmota-metrics==0.4.3 PyYAML==6.0.3
+
+      - name: Add the UART touch extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src/custom
+          cat > src/custom/my_custom.cpp <<'OPENHASP_CUSTOM_CPP'
+          // SPDX-License-Identifier: MIT
+          #include "hasplib.h"
+
+          #if defined(HASP_USE_CUSTOM) && HASP_USE_CUSTOM > 0
+
+          #include <Arduino.h>
+          #include <HardwareSerial.h>
+          #include <freertos/FreeRTOS.h>
+          #include <freertos/queue.h>
+          #include <string.h>
+
+          #include "hasp_debug.h"
+          #include "my_custom.h"
+          #include "touch_uart_protocol.h"
+
+          #ifndef TOUCH_UART_TX_PIN
+          #define TOUCH_UART_TX_PIN 22
+          #endif
+          #ifndef TOUCH_UART_BAUD
+          #define TOUCH_UART_BAUD 115200
+          #endif
+
+          #if !defined(CONFIG_IDF_TARGET_ESP32)
+          #error "This UART2 configuration is prepared for the classic ESP32-3248S035C."
+          #endif
+
+          static_assert(TOUCH_UART_TX_PIN == 22,
+                        "A different pin requires checking the board wiring first.");
+
+          namespace {
+          QueueHandle_t event_queue = nullptr;
+          bool uart_ready = false;
+          }
+
+          void custom_setup()
+          {
+              event_queue = xQueueCreate(16, sizeof(touch_uart::Event));
+              if(event_queue == nullptr) {
+                  LOG_ERROR(TAG_CUSTOM, "Touch UART: cannot allocate event queue");
+                  return;
+              }
+
+              // Keep the USB/programming console on UART0. UART2 has TX only; specifying
+              // TX explicitly prevents Arduino 2.x from assigning the default RX/TX pins.
+              Serial2.setTxBufferSize(256);
+              Serial2.begin(TOUCH_UART_BAUD, SERIAL_8N1, -1, TOUCH_UART_TX_PIN);
+              uart_ready = static_cast<bool>(Serial2);
+              if(!uart_ready) {
+                  vQueueDelete(event_queue);
+                  event_queue = nullptr;
+                  LOG_ERROR(TAG_CUSTOM, "Touch UART: UART2 initialization failed");
+              }
+          }
+
+          void custom_state_subtopic(const char* subtopic, const char* payload)
+          {
+              if(!uart_ready || payload == nullptr) return;
+              touch_uart::Event event{};
+              if(!touch_uart::parse_object_topic(subtopic, event)) return;
+
+              // Read just the event field. Arbitrary tags must not exhaust the document.
+              StaticJsonDocument<32> filter;
+              filter["event"] = true;
+              StaticJsonDocument<64> message;
+              if(deserializeJson(message, payload,
+                                 DeserializationOption::Filter(filter))) return;
+              const char* event_name = message["event"];
+              if(event_name == nullptr || strcmp(event_name, "down") != 0) return;
+
+              // Never wait inside an LVGL event callback. There is no replay at boot.
+              if(xQueueSend(event_queue, &event, 0) != pdTRUE) {
+                  LOG_WARNING(TAG_CUSTOM, "Touch UART: event queue full; event skipped");
+              }
+          }
+
+          void custom_loop()
+          {
+              if(!uart_ready) return;
+              touch_uart::Event event{};
+              while(xQueuePeek(event_queue, &event, 0) == pdTRUE) {
+                  char frame[8];
+                  const size_t length = touch_uart::format_event(event, frame, sizeof(frame));
+                  if(length == 0) {
+                      xQueueReceive(event_queue, &event, 0);
+                      continue;
+                  }
+                  if(Serial2.availableForWrite() < static_cast<int>(length)) return;
+                  Serial2.write(reinterpret_cast<const uint8_t*>(frame), length);
+                  xQueueReceive(event_queue, &event, 0);
+              }
+          }
+
+          bool custom_pin_in_use(uint8_t pin)
+          {
+              return pin == TOUCH_UART_TX_PIN;
+          }
+
+          void custom_every_second() {}
+          void custom_every_5seconds() {}
+          void custom_get_sensors(JsonDocument&) {}
+          void custom_topic_payload(const char*, const char*, uint8_t) {}
+
+          #endif
+          OPENHASP_CUSTOM_CPP
+          cat > src/custom/my_custom.h <<'OPENHASP_CUSTOM_HEADER'
+          #ifndef HASP_CUSTOM_H
+          #define HASP_CUSTOM_H
+
+          #include "hasplib.h"
+
+          #if defined(HASP_USE_CUSTOM) && HASP_USE_CUSTOM > 0
+          void custom_setup();
+          void custom_loop();
+          void custom_every_second();
+          void custom_every_5seconds();
+          bool custom_pin_in_use(uint8_t pin);
+          void custom_get_sensors(JsonDocument& doc);
+          void custom_topic_payload(const char* topic, const char* payload, uint8_t source);
+          void custom_state_subtopic(const char* subtopic, const char* payload);
+          #endif
+
+          #endif
+          OPENHASP_CUSTOM_HEADER
+          cat > src/custom/touch_uart_protocol.h <<'OPENHASP_UART_PROTOCOL'
+          // SPDX-License-Identifier: MIT
+          #ifndef TOUCH_UART_PROTOCOL_H
+          #define TOUCH_UART_PROTOCOL_H
+
+          #include <stddef.h>
+          #include <stdint.h>
+          #include <stdio.h>
+
+          namespace touch_uart {
+
+          struct Event {
+              uint8_t page;
+              uint8_t object;
+          };
+
+          // Parse only object topics, not page changes, telemetry or attribute replies.
+          inline bool read_number(const char*& cursor, unsigned limit, unsigned& number)
+          {
+              if(*cursor < '0' || *cursor > '9') return false;
+              number = 0;
+              do {
+                  number = number * 10U + static_cast<unsigned>(*cursor - '0');
+                  if(number > limit) return false;
+                  ++cursor;
+              } while(*cursor >= '0' && *cursor <= '9');
+              return true;
+          }
+
+          inline bool parse_object_topic(const char* topic, Event& event)
+          {
+              if(topic == nullptr || *topic++ != 'p') return false;
+              unsigned page = 0;
+              unsigned object = 0;
+              if(!read_number(topic, 12, page) || *topic++ != 'b') return false;
+              if(!read_number(topic, 254, object) || object == 0 || *topic != '\0') return false;
+              event.page = static_cast<uint8_t>(page);
+              event.object = static_cast<uint8_t>(object);
+              return true;
+          }
+
+          // The largest frame is "12,254\n" (7 bytes plus the terminating C string NUL).
+          inline size_t format_event(const Event& event, char* output, size_t capacity)
+          {
+              if(output == nullptr || capacity == 0 || event.page > 12 ||
+                 event.object == 0 || event.object > 254) return 0;
+              const int length = snprintf(output, capacity, "%u,%u\n",
+                                          static_cast<unsigned>(event.page),
+                                          static_cast<unsigned>(event.object));
+              if(length < 0 || static_cast<size_t>(length) >= capacity) return 0;
+              return static_cast<size_t>(length);
+          }
+
+          } // namespace touch_uart
+          #endif
+          OPENHASP_UART_PROTOCOL
+          cat > platformio_override.ini <<'OPENHASP_UART_ENV'
+          ; Source baseline: HASwitchPlate/openHASP d1a0770c8a992c2945a1c9c5702d2e6cfb9cb705
+          ; Original environment, display, touch, fonts and flash partitions are inherited.
+          [platformio]
+          extra_configs =
+              user_setups/esp32/esp32-3248s035.ini
+          default_envs = esp32-3248s035c_uart_4MB
+
+          [env:esp32-3248s035c_uart_4MB]
+          extends = env:esp32-3248s035c_4MB
+          build_flags =
+              ${env:esp32-3248s035c_4MB.build_flags}
+              -D HASP_USE_CUSTOM=1
+              -D TOUCH_UART_TX_PIN=22
+              -D TOUCH_UART_BAUD=115200
+          lib_deps =
+              git+https://github.com/HASwitchPlate/lvgl.git#0af8c7a950157234f96256aec8ec3b761f2d76d8
+              git+https://github.com/lvgl/lv_lib_png.git#d42282b8673cffdc9010289e8ef149bcb6ec013f
+              git+https://github.com/lvgl/lv_lib_bmp.git#b6ca85d4d4a0d09c6a04a14c61d992ade19f5fec
+              git+https://github.com/lvgl/lv_lib_gif.git#afdc2d69c7e80210256fd84837b839320fe2618a
+              bblanchon/ArduinoJson@6.21.5
+              git+https://github.com/fvanroie/ConsoleInput.git#79180a9491b3d5617b519267c80675d2302079b3
+              bxparks/AceButton@1.10.1
+              bblanchon/StreamUtils@1.8.0
+              lovyan03/LovyanGFX@1.2.21
+          OPENHASP_UART_ENV
+
+      - name: Compile firmware for ESP32-3248S035C 4MB
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m platformio run -e esp32-3248s035c_uart_4MB -j 4 2>&1 | tee build-uart.log
+
+      - name: Check and collect firmware
+        shell: python
+        run: |
+          from pathlib import Path
+          import datetime
+          import hashlib
+          import shutil
+          import struct
+          import subprocess
+
+          build = Path('.pio/build/esp32-3248s035c_uart_4MB')
+          image = build / 'firmware.bin'
+          limit = 1728 * 1024
+          data = image.read_bytes()
+          if not data or data[0] != 0xE9:
+              raise SystemExit('Missing or invalid Espressif application image')
+          if len(data) > limit:
+              raise SystemExit(f'Image too large for the original OTA slot: {len(data)} > {limit}')
+          if struct.unpack_from('<H', data, 12)[0] != 0:
+              raise SystemExit('Application image is not for the classic ESP32')
+
+          output = Path('uart-firmware')
+          output.mkdir(exist_ok=True)
+          ota = output / 'esp32-3248s035c-uart-4MB-ota.bin'
+          shutil.copy2(image, ota)
+          full_images = list(Path('build_output/firmware').glob('*_full_4MB_*.bin'))
+          if len(full_images) != 1:
+              raise SystemExit('Expected one merged USB image from the original openHASP build script')
+          shutil.copy2(full_images[0], output / 'esp32-3248s035c-uart-4MB-full.bin')
+          checksums = []
+          for path in sorted(output.glob('*.bin')):
+              checksums.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}')
+          (output / 'SHA256SUMS.txt').write_text('\n'.join(checksums) + '\n', encoding='utf-8')
+          info = [
+              'openHASP 0.7.0.1 + UART touch events',
+              'Board: ESP32-3248S035C; ST7796; capacitive GT911; 4MB flash',
+              'Source: d1a0770c8a992c2945a1c9c5702d2e6cfb9cb705',
+              'Environment: esp32-3248s035c_uart_4MB',
+              'UART2 TX: GPIO22; 115200 baud; 8N1; 3.3V TTL',
+              'Protocol: page,id followed by LF; only the down event',
+              f'Application: {len(data)} bytes; OTA slot: {limit} bytes',
+              'Built UTC: ' + datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              '',
+              'ota.bin: application image for the openHASP web OTA updater.',
+              'full.bin: merged USB image; flash at offset 0x0.',
+              'Keep a backup of the panel configuration and JSONL before flashing.',
+              'Hardware operation and OTA acceptance still need testing on the panel.',
+          ]
+          (output / 'BUILD_INFO.txt').write_text('\n'.join(info) + '\n', encoding='utf-8')
+          python = shutil.which('python')
+          esptool = Path.home() / '.platformio/packages/tool-esptoolpy/esptool.py'
+          subprocess.run([python, str(esptool), '--chip', 'esp32', 'image_info', str(ota)], check=True)
+          print(f'Application fits OTA: {len(data)} / {limit} bytes')
+
+      - name: Downloadable firmware
+        uses: actions/upload-artifact@v6
+        with:
+          name: esp32-3248s035c-uart-4MB
+          path: uart-firmware/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: esp32-3248s035c-uart-build-log
+          path: build-uart.log
+          if-no-files-found: ignore
+          retention-days: 14
